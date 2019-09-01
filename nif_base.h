@@ -115,6 +115,11 @@ protected:
 	CFixedSizedQuadIb* ib;
 
 public:
+	int getScreenW(void) { return screenW; }
+	int getScreenH(void) { return screenH; }
+	Orig* getAlignOrigs(void) { return alignOrigs; }
+	AlignDiff* getAlignDiffs(void) { return alignDiffs; }
+
 	CNIFFontBitmap& getTex(void) { return tex; }
 	void init(CApp11FontBitmapDynamic* dynBitmap, CFixedSizedQuadIb* ib, int cellHeight, int capacity, int screenW, int screenH);
 
@@ -152,7 +157,10 @@ public:
 	void setColorIdxSlice(unsigned int idx, unsigned char colorIdx, unsigned char slice);
 
 public:
-	void updateBuffer(void);
+	void updateVbColorIdx(void);
+
+public:
+	void dump(void);
 };
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -240,43 +248,53 @@ public:
 //					CNIFStaticBuffer
 //
 //1, moving icon can be done in 3 steps -> a, remove icon, b, use another shader to render moving oject, c, drop to add back.
+//2, *** if order is needed, there must be an order tree, add/rebuild according to order tree, but, i think, use idc_control as order is enough.
+//	what's the point creating a lot of overlaps in one dialog?
 class CNIFStaticBuffer : public CNIFBase, public CNIFColorIdx
 {
 public:
+	struct ControlInfo;
+	typedef void(*CB)(int msg_type, CNIFStaticBuffer* sb, unsigned int idc_control, ControlInfo* ci);  
+
 	struct ControlInfo {
 		unsigned char type;
 		int x0, x1, y0, y1;
 		float ltu, ltv, bru, brv;
 
 		unsigned int strHeadNode;
-		char align;		//0-5, index is faster than (alignX, alignY)
+		char align;		//0-8, index is faster than (alignX, alignY), relative to window
+		char localAlign;			//relative to control box(x0,x1,y0,y1)
 		unsigned char slice;
+		unsigned char colorIdx;		//this is for image
 		unsigned int vbPosIdx;
+		CB cb;
+		ControlInfo() : cb(NULL), localAlign(-1){}
 	};
 
 	struct Char {
 		wchar_t c;					//every c has a unique id.
 		unsigned short id;			//id in CNIFBase::tex for char info, especially w
-		unsigned char colorIdx;
+		unsigned char colorIdx;		//this is for text/char
 	};
 
 	typedef GE_SP::CDynBvh<unsigned int>bvh_type;		//key is IDC_EDITBOX
 	typedef CDoubleLinkedListPool<Char, unsigned short> pool_type;			//for texts
 	typedef CAVL_Tree<unsigned int, ControlInfo> tree_type;	//key is IDC_EDITBOX
 
+private:
+	unsigned int vbPosIdx;		
+
 protected:
-	unsigned int vbPosIdx;
 	bvh_type bvh;		//for search
 	pool_type pool;		//store editbox string, and a pointer to char info
 	tree_type controls;
 
 	bvh_type::query_result_type query_result;
 
-	void getStringColorsFromPool(unsigned int headNodeId, CGrowableArrayWithLast<wchar_t>&str, CGrowableArrayWithLast<unsigned char>&colors);
-
 protected:		//buffers and alignIds
 	CApp11DynamicBuffer<CVector2> vbPos;
 	CApp11DynamicBuffer<CVector2> vbUv;
+	//CApp11DynamicBuffer<Indices> vbColorIdx;   //this has been moved to CNIFColorIdx
 
 	//about parent: create a parent list, assign all square to parent, when moving parent, all children move along with it.
 	//parent can be an dummy object or have an 'background' image to it.
@@ -285,20 +303,49 @@ protected:		//buffers and alignIds
 	CGrowableArrayWithLast<unsigned int>alignIds;
 
 public:
+	pool_type& getPool(void) { return pool; }
+	CApp11DynamicBuffer<CVector2>& getVbUv(void) { return vbUv; }
+	CApp11DynamicBuffer<CVector2>& getVbPos(void) { return vbPos; }
 	CNIFStaticBuffer() : vbPos(CApp11DynamicBuffer<CVector2>::vb_type),
-		vbUv(CApp11DynamicBuffer<CVector2>::vb_type), vbPosIdx(0){}
+		vbUv(CApp11DynamicBuffer<CVector2>::vb_type), vbPosIdx(0), lastMouseOverId(-1), lastLBtnDownId(-1), lastRBtnDownId(-1){}
 
 	//
 	// basic functions
 	//
-	bool addText(unsigned int idc_control, unsigned int alignId, wchar_t* str, unsigned char* colors, 
-		int x0, int x1, int y0, int y1, bool addToAvlBvh);  //input coordinates is range
-	void addImage(unsigned int idc_control, unsigned int alignId, unsigned char slice, 
+	bool addText(unsigned int idc_control, unsigned int alignId, char localAlign, wchar_t* str, unsigned char* colors, 
+		int x0, int x1, int y0, int y1, bool addToAvlBvh, bool createFont, int strLen, int& added, bool autoWrap, int& totalLines);  //input coordinates is range
+	void addImage(unsigned int idc_control, unsigned int alignId, unsigned char slice, unsigned char colorIdx,
 		float ltu, float ltv, float bru, float brv, 
-		int x0, int x1, int y0, int y1, bool addToAvlBvh); //input coordinates is range
-	void addSquardIcon(unsigned int idc_control, unsigned int alignId, unsigned char slice, 
+		int x0, int x1, int y0, int y1, bool addToAvlBvh, unsigned int reservedVbPos); //input coordinates is range
+	void addSquardIcon(unsigned int idc_control, unsigned int alignId, unsigned char slice, unsigned char colorIdx,
 		int imageW, int iconW, int iconx, int icony, int x, int y, bool addToAvlBvh);
-	void rebuildFromAvl(void);
+	void rebuildFromAvl(bool createFont);
+	void moveControl(unsigned int idc_control, int dx, int dy);
+	void moveAllControlsInBvh(bvh_type::Node*node, int dx, int dy);
+	void moveAllControls(int dx, int dy);
+	unsigned int reserveQuad(void);
+
+	//
+	// string/text functions
+	//
+	void addText(pool_type::HeadNode* headNode, wchar_t* str, unsigned char* colors, int strLen);
+	bool replaceText(ControlInfo* ci, wchar_t* str, unsigned char* colors, int strLen);
+	void delText(unsigned int strHeadNodeId);
+	void getStringColorsFromPool(unsigned int headNodeId, CGrowableArrayWithLast<wchar_t>& str, CGrowableArrayWithLast<unsigned char>& colors);
+	void getStringFromPool(unsigned int headNodeId, CGrowableArrayWithLast<wchar_t>& str);
+
+	//
+	// misc
+	//
+	bool changeTextColor(ControlInfo* ci, unsigned char* colors, unsigned int cnt);
+	bool changeTextColor(ControlInfo* ci, unsigned char colorIdx);
+
+	bool changeTextColor(unsigned int idc_control, unsigned char* colors, unsigned int cnt);
+	bool changeTextColor(unsigned int idc_control, unsigned char colorIdx);
+	void changeColorIdx(unsigned int idc_control, unsigned char colorIdx);
+	void alignText(ControlInfo* ci, int oldAlignedId, int newAlignId);
+	int getTextLenInPixel(ControlInfo* ci, int&cnt);
+	void shiftTextX(ControlInfo* ci, int cnt, float dx);
 
 	//
 	// deletion
@@ -315,13 +362,52 @@ public:
 	// update
 	//
 	void updateVbPos(void);
-	void updatePosUvColor(void);
+	void updateVbPosUvColor(void);
 
 	// bvh
 	unsigned int bvhFind(int x, int y);
+	bool bvhDel(GE_MATH::CAabbBox4D& box, unsigned int id);
+	bvh_type::Node* bvhAdd(GE_MATH::CAabbBox4D& box);
+	bvh_type::query_result_type& getQueryResult(void) { return query_result; }
+
+	//avl
+	ControlInfo* avlFind(unsigned int idc_control);
+
+
+protected:
+	unsigned int lastMouseOverId, lastLBtnDownId, lastRBtnDownId;
+
+public:
+	//
+	// mouse messages 
+	//
+	//up down pair: a down must be paired with a up for a control
+	static const int MSG_LBTN_DOWN = 0;
+	static const int MSG_LBTN_UP = 1;
+
+	//leave over pair: multiple over, but one leave
+	static const int MSG_MOUSE_LEAVE = -1;
+	static const int MSG_MOUSE_OVER = 2;
+
+	//
+	static const int MSG_RBTN_DOWN = 3;
+	static const int MSG_RBTN_UP = 4;
+
+
+	//
+	// callbacks
+	//
+	unsigned int getLastMouseOverId(void) { return lastMouseOverId; }
+	unsigned int getLastLBtnDownId(void) { return lastLBtnDownId; }
+	unsigned int getLastRBtnDownId(void) { return lastRBtnDownId; }
+	void processCallbacks(int x, int y, int msg_type);
+	void onlBtnClickCallbacks(int x, int y, int msg_type, unsigned char colorLeave, unsigned char colorOver, unsigned char colorDown);
+	void onrBtnDrag(int x, int y, int dx, int dy, int msg_type);
+	void setCallback(int idc_control, CB cb);
 
 public: //debug
 	void dump(void);
+	void dumpBox(CGrowableArrayWithLast< GE_MATH::CAabbBox4D>& boxes);
 };
 
 
