@@ -1,10 +1,13 @@
-//1, differences: display grid and pixels -> grid start from 0, pixels start from 0.5
-//2, The edges of the input quad need to lie upon the boundary lines between pixel cells. By simply shifting the x and y quad coordinates by -0.5 units, 
-//	texel cells will perfectly cover pixel cells and the quad can be perfectly recreated on the screen
-//3***, picture a 2x2 screen mapped with 2x2 texture quad, the pixels/texels are located at each individual center of screen cells.
-//4******-> screen cell centers, pixels, texels, those THREE things are at the same place. (pixel/texel are all infinitely small points, screen cells are 
-//	not, they are squares), and no such thing as texel quad??  
-//5, all above are for how to rasterize, with all those anti-aliasing technique or how to precisely(no streches) put a texture on screen.
+//*, this is quad/rect-based interface, all quads are stored in either a static class or dynamic class, search support: bvh/avl
+//*, dynamic class mainly is used for editbox, static class is for all others.
+//*, vertices in quad are pre-tranformed, so, rendering is the fastest, moving is relatively slow, because every vertex needs to be
+//	transformed on CPU side then update to GPU, but, it's fine, because transforming is a really simple operation(just an addition)
+//*, 
+
+//1, order: the render order is the same as controls's creation order, in case rebuild(), the order is the idc_control
+
+
+
 
 
 #include "stdafx.h"
@@ -312,7 +315,7 @@ void CNIFBase::dump(CApp11DynamicBuffer<CVector2> &vbPos)
 /////////////////////////////////////////////////////////////////////////////////
 //					CNIFColorIdx
 //
-void CNIFColorIdx::updateBuffer(void)
+void CNIFColorIdx::updateVbColorIdx(void)
 {
 	vbColorIdx.updateBuffer();
 }
@@ -344,6 +347,11 @@ void CNIFColorIdx::setAllTextColor(unsigned char colorIdx, unsigned int cnt)
 		indices.colorIdx = colorIdx;
 		indices.slice = 0xff;
 	}
+}
+
+void CNIFColorIdx::dump(void)
+{
+	ODS("vbColorIdx [%d/%d]\n", vbColorIdx.getData().get_count(), vbColorIdx.getData().get_cap());
 }
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -434,15 +442,17 @@ bool CNIFDynamicBuffer::del(unsigned int idc_editbox)
 	//
 	// delete control specific data
 	//
-	CGrowableArrayWithLast<wchar_t>str;
-	getStringColorsFromPool(eb->strHeadNode, str);
-	wchar_t* p = str.get_objects();
-	while (*p) {
-		//delete from font bitmap
-		tex.delChar(*p);
-		p++;
+	if (eb->strHeadNode != -1) {
+		CGrowableArrayWithLast<wchar_t>str;
+		getStringColorsFromPool(eb->strHeadNode, str);
+		wchar_t* p = str.get_objects();
+		while (*p) {
+			//delete from font bitmap
+			tex.delChar(*p);
+			p++;
+		}
+		pool.delList(eb->strHeadNode);
 	}
-	pool.delList(eb->strHeadNode);
 
 	//
 	// delete from controls
@@ -955,7 +965,7 @@ void CNIFDynamicBuffer::updateVb(void)
 {
 	vbPos.updateBuffer();
 	vbUv.updateBuffer();
-	CNIFColorIdx::updateBuffer();
+	CNIFColorIdx::updateVbColorIdx();
 }
 
 void CNIFDynamicBuffer::render(void)
@@ -1056,9 +1066,211 @@ void CNIFDynamicBuffer::resize(int screenW, int screenH)
 //					CNIFStaticBuffer
 //
 //1, int x0, int x1, int y0, int y1 -> target box, and they are in screen space (topleft (0,0))
-bool CNIFStaticBuffer::addText(unsigned int idc_control, unsigned int alignId, wchar_t* str, unsigned char* colors, 
-	int x0, int x1, int y0, int y1, bool addToAvlBvh)
+bool CNIFStaticBuffer::changeTextColor(unsigned int idc_control, unsigned char* colors, unsigned int cnt)
 {
+	ControlInfo* eb = controls.find(idc_control);
+	geAssert(eb);
+
+	return changeTextColor(eb, colors, cnt);
+}
+
+bool CNIFStaticBuffer::changeTextColor(unsigned int idc_control, unsigned char colorIdx)
+{
+	ControlInfo* eb = controls.find(idc_control);
+	geAssert(eb);
+
+	return changeTextColor(eb, colorIdx);
+}
+
+// problem: if not all text is displayed.
+bool CNIFStaticBuffer::changeTextColor(ControlInfo* eb, unsigned char* colors, unsigned int cnt)
+{
+	pool_type::HeadNode* headNode = pool.headNodeId2Ptr(eb->strHeadNode);
+
+	geAssert(pool.count(headNode) == cnt);
+
+	int i = 0;
+	for (pool_type::Node* node = pool.getFirstNode(headNode); node; i++, node = pool.getNextNode(node)) {
+		node->t.colorIdx = colors[i];
+	}
+
+	for (unsigned int i = 0; i < cnt; i++) {
+		unsigned int idx = eb->vbPosIdx * 4 + i * 4;
+		geAssert(idx + 4 <= vbColorIdx.getData().get_count());
+		Indices* indices = vbColorIdx.getData().get_objects() + idx;
+		unsigned int c = colors[i];
+		for (int j = 0; j < 4; j++) {
+			indices[j].colorIdx = c;
+		}
+	}
+
+	return true;
+}
+
+// problem: if not all text is displayed.
+bool CNIFStaticBuffer::changeTextColor(ControlInfo* eb, unsigned char colorIdx)
+{
+	pool_type::HeadNode* headNode = pool.headNodeId2Ptr(eb->strHeadNode);
+
+	unsigned int cnt = 0;
+	for (pool_type::Node* node = pool.getFirstNode(headNode); node; node = pool.getNextNode(node)) {
+		node->t.colorIdx = colorIdx;
+		cnt++;
+	}
+
+	for (unsigned int i = 0; i < cnt; i++) {
+		unsigned int idx = eb->vbPosIdx * 4 + i * 4;
+		geAssert(idx + 4 <= vbColorIdx.getData().get_count());
+		Indices* indices = vbColorIdx.getData().get_objects() + idx;
+		for (int j = 0; j < 4; j++) {
+			indices[j].colorIdx = colorIdx;
+		}
+	}
+
+	return true;
+}
+
+//dx in clip space
+void CNIFStaticBuffer::shiftTextX(ControlInfo* ci, int cnt, float dx)
+{
+	CVector2* poses = vbPos.getData().get_objects();
+	poses += ci->vbPosIdx * 4;
+	for (int i = 0; i < cnt; i++) {
+		for (int j = 0; j < 4; j++) {
+			poses->x += dx;
+			poses++;
+		}
+	}
+}
+
+//oldAlignedId, newAlignId are all relative to text box(x0,x1,y0,y1), not screen alignment.
+void CNIFStaticBuffer::alignText(ControlInfo* ci, int oldAlignedId, int newAlignId)
+{
+	if (oldAlignedId == newAlignId) {
+		return;
+	}
+
+	int strLen;
+	int strW = getTextLenInPixel(ci, strLen);
+	int rectW = ci->x1 - ci->x0;
+	int halfRectW = rectW >> 1;
+	int halfStrW = strW >> 1;
+
+	int alignOldX0;
+	switch (oldAlignedId) {
+	case -1:		//left
+		alignOldX0 = 0;
+		break;
+	case 0:			//center
+		alignOldX0 = halfRectW - halfStrW;
+		break;
+	case 1:			//right
+		alignOldX0 = rectW - strW;
+		break;
+	}
+	
+	int alignNewX0;
+	switch (newAlignId) {
+	case -1:		//left
+		alignNewX0 = 0;
+		break;
+	case 0:			//center
+		alignNewX0 = halfRectW - halfStrW;
+		break;
+	case 1:			//right
+		alignNewX0 = rectW - strW;
+		break;
+	}
+
+	float dx = (float)(alignNewX0 - alignOldX0);
+
+	float pixelWidth = 2.f / screenW;
+
+	dx *= pixelWidth;
+	dx -= pixelWidth * 0.5f;
+
+	shiftTextX(ci, strLen, dx);
+}
+
+int CNIFStaticBuffer::getTextLenInPixel(ControlInfo* ci, int&cnt)
+{
+	cnt = 0;
+	float len = 0;
+	geAssert(ci->strHeadNode != -1);
+	pool_type::HeadNode* headNode = pool.headNodeId2Ptr(ci->strHeadNode);
+	for (pool_type::Node* node = pool.getFirstNode(headNode); node; node = pool.getNextNode(node)) {
+		CNIFFontBitmap::infos_type::Node* infosNode = tex.infosId2Ptr(node->t.id);
+		CNIFFontBitmap::CHAR_INFO* cinfo = &infosNode->value;
+		len += cinfo->info.w;
+		cnt++;
+	}
+	return (int)len;
+}
+
+//addText add char to tex and increase ref_count.
+//then add char to pool for headNode.
+void CNIFStaticBuffer::addText(pool_type::HeadNode* headNode, wchar_t* str, unsigned char* colors, int strLen)
+{
+	int i = 0;
+	while (*str) {
+		CNIFFontBitmap::infos_type::Node* infosNode = tex.find(*str);
+		if (!infosNode) {
+			CApp11FontBitmap::CHAR_INFO* info = tex.getDynBitmap()->add_word(*str);	//info is the one in dynBitmap
+			infosNode = tex.convert(*str, *info);			//info has been converted in the one in tex, because I am using this bitmap(local)
+			infosNode->value.ref_count = 1;					//if font has just been created, ref will have to be increased all times.
+		}
+		else {
+			CNIFFontBitmap::CHAR_INFO* nif_char_info = &infosNode->value;
+			nif_char_info->ref_count++;
+		}
+
+		//
+		// add char to pool
+		//
+		Char* pc;
+		pc = pool.addLast(headNode);
+		pc->c = *str;
+		pc->id = tex.infosPtr2Id(infosNode);
+		pc->colorIdx = colors[i++];		//align is in the head
+
+		str++;
+	}
+}
+
+//replaceText is faster than del() then add() sometimes, if most char in the deleted is still in newly added.
+//after replaceText(), rebuild() must be called to reflect changes.
+bool CNIFStaticBuffer::replaceText(ControlInfo* ci, wchar_t* str, unsigned char* colors, int strLen)
+{
+	unsigned int oldStrHeadNodeId = ci->strHeadNode;
+
+	//
+	// assign a newly allocated to eb
+	//
+	pool_type::HeadNode* headNode = pool.newHeadNode();
+	ci->strHeadNode = pool.headNodePtr2Id(headNode);
+
+	//
+	// add str to tex
+	//
+	addText(headNode, str, colors, strLen);
+
+	//
+	// remove old string
+	//
+	delText(oldStrHeadNodeId);
+
+	return true;
+}
+
+//1, addToAvlBvh is false usually on rebuilding.
+//2, createFont: sometimes, fontbitmap has already been created for this text control, user doesn't want anything in font bitmap to change.
+//	for example, delete a text control, maybe then add another one back in, after this rebuild_from_avl is called, 
+//	in this case, font data need not to be changed at all.  -> this usually only can be false when used from create_from_avl()
+bool CNIFStaticBuffer::addText(unsigned int idc_control, unsigned int alignId, char localAlign, wchar_t* str, unsigned char* colors,
+	int x0, int x1, int y0, int y1, bool addToAvlBvh, bool createFont, int strLen, int&added, bool autoWrap, int& totalLines)
+{
+	totalLines = 1;
+
 	//
 	// from aligned/object space to world space. (screen space)
 	//
@@ -1075,7 +1287,7 @@ bool CNIFStaticBuffer::addText(unsigned int idc_control, unsigned int alignId, w
 		//
 		// add to avl tree
 		//
-		controls.add(idc_control);
+		eb = controls.add(idc_control);
 		geAssert(eb);
 		eb->x0 = x0;
 		eb->y0 = y0;
@@ -1084,6 +1296,7 @@ bool CNIFStaticBuffer::addText(unsigned int idc_control, unsigned int alignId, w
 		headNode = pool.newHeadNode();
 		eb->strHeadNode = pool.headNodePtr2Id(headNode);
 		eb->align = alignId;
+		eb->localAlign = localAlign;
 		eb->type = 0;
 
 		eb->slice = 255;
@@ -1111,7 +1324,6 @@ bool CNIFStaticBuffer::addText(unsigned int idc_control, unsigned int alignId, w
 	// advance vbPosIdx
 	//
 	eb->vbPosIdx = vbPosIdx;
-	vbPosIdx += wcslen(str);
 
 	//
 	//transform coordinates from lefttop(0,0) to center(0,0)
@@ -1150,21 +1362,24 @@ bool CNIFStaticBuffer::addText(unsigned int idc_control, unsigned int alignId, w
 
 	unsigned int colorIdx = 0;
 
-	int strLen = wcslen(str);
 	pool.reserveNode(strLen);
 
+	added = 0;
 	while (*str) {
 		//no need to worry about ref_count in static bitmap.
 		CNIFFontBitmap::infos_type::Node* infosNode = tex.find(*str);
 		CApp11FontBitmap::CHAR_INFO* info;
 		if (!infosNode) {
+			geAssert(createFont);		
 			info = tex.getDynBitmap()->add_word(*str);	//info is the one in dynBitmap
 			infosNode = tex.convert(*str, *info);			//info has been converted in the one in tex, because I am using this bitmap(local)
-			infosNode->value.ref_count = 1;
+			infosNode->value.ref_count = 1;		//if font has just been created, ref will have to be increased all times.
 		}
 		else {
 			CNIFFontBitmap::CHAR_INFO* nif_char_info = &infosNode->value;
-			nif_char_info->ref_count++;
+			if (createFont) {
+				nif_char_info->ref_count++;
+			}
 		}
 		info = &infosNode->value.info;
 
@@ -1183,8 +1398,29 @@ bool CNIFStaticBuffer::addText(unsigned int idc_control, unsigned int alignId, w
 		xb -= pixelWidth * 0.5f;
 
 		if (xb > xEnd) {
-			break;
+			if (autoWrap) {
+				x = (float)x0;
+				xa = x * pixelWidth;
+				
+				x += info->w;
+				xb = x * pixelWidth;
+
+				yTop = (y0 - h * totalLines) * pixelHeight;
+				yBot = (y0 - h * (totalLines + 1)) * pixelHeight;
+
+				xa -= pixelWidth * 0.5f;
+				xb -= pixelWidth * 0.5f;
+				yTop -= pixelHeight * 0.5f;
+				yBot -= pixelHeight * 0.5f;
+
+				totalLines++;
+			}
+			else {
+				break;
+			}
 		}
+
+		added++;
 
 		v.set(xa, yTop); vbPos.push(v);
 		uv.set(info->ltu, info->ltv); vbUv.push(uv);		//left top
@@ -1216,12 +1452,39 @@ bool CNIFStaticBuffer::addText(unsigned int idc_control, unsigned int alignId, w
 		xa = xb;
 	}
 
+	vbPosIdx += added;
+
+	if (localAlign != -1) {		//-1 means left
+		alignText(eb, -1, localAlign);
+	}
+
 	return true;
 }
 
-void CNIFStaticBuffer::addImage(unsigned int idc_control, unsigned int alignId, unsigned char slice,
+unsigned int CNIFStaticBuffer::reserveQuad(void)
+{
+	for (int j = 0; j < 4; j++) {
+		//
+		CVector2 v, uv;
+		vbPos.push(v);
+		vbUv.push(uv);
+
+		//push 
+		alignIds.push(0);
+
+		//
+		Indices& indice = vbColorIdx.append();
+		indice.colorIdx = 0;		//white
+		indice.slice = 0;
+	}
+	return vbPosIdx++;
+}
+
+//1, addToAvlBvh is false usually on rebuilding.
+//2, reservedVbPos: 
+void CNIFStaticBuffer::addImage(unsigned int idc_control, unsigned int alignId, unsigned char slice, unsigned char colorIdx,
 	float ltu, float ltv, float bru, float brv, 
-	int x0, int x1, int y0, int y1, bool addToAvlBvh)
+	int x0, int x1, int y0, int y1, bool addToAvlBvh, unsigned int reservedVbPos)
 {
 	Orig& orig = alignOrigs[alignId];
 
@@ -1244,6 +1507,7 @@ void CNIFStaticBuffer::addImage(unsigned int idc_control, unsigned int alignId, 
 		eb->strHeadNode = pool.headNodePtr2Id(headNode);
 		eb->align = alignId;
 		eb->type = 1;
+		eb->colorIdx = colorIdx;
 
 		eb->bru = bru;
 		eb->brv = brv;
@@ -1274,7 +1538,9 @@ void CNIFStaticBuffer::addImage(unsigned int idc_control, unsigned int alignId, 
 	//
 	// advance vbPosIdx
 	//
-	eb->vbPosIdx = vbPosIdx++;
+	if (reservedVbPos == -1) {
+		eb->vbPosIdx = vbPosIdx++;
+	}
 
 	//
 	//transform coordinates from lefttop(0,0) to center(0,0)
@@ -1302,36 +1568,76 @@ void CNIFStaticBuffer::addImage(unsigned int idc_control, unsigned int alignId, 
 	xa -= pixelWidth * 0.5f;
 	xb -= pixelWidth * 0.5f;
 
-	CVector2 v, uv;
-	v.set(xa, yTop); vbPos.push(v);
-	uv.set(ltu, ltv); vbUv.push(uv);		//left top
+	if (reservedVbPos == -1) {
+		CVector2 v, uv;
+		v.set(xa, yTop); vbPos.push(v);
+		uv.set(ltu, ltv); vbUv.push(uv);		//left top
 
-	v.set(xb, yTop);  vbPos.push(v);
-	uv.set(bru, ltv);  vbUv.push(uv);		//right top
+		v.set(xb, yTop);  vbPos.push(v);
+		uv.set(bru, ltv);  vbUv.push(uv);		//right top
 
-	v.set(xa, yBot);  vbPos.push(v);
-	uv.set(ltu, brv);  vbUv.push(uv);		//left bottom
+		v.set(xa, yBot);  vbPos.push(v);
+		uv.set(ltu, brv);  vbUv.push(uv);		//left bottom
 
-	v.set(xb, yBot);  vbPos.push(v);
-	uv.set(bru, brv);  vbUv.push(uv);		//right bottom
+		v.set(xb, yBot);  vbPos.push(v);
+		uv.set(bru, brv);  vbUv.push(uv);		//right bottom
 
-	for (int j = 0; j < 4; j++) {
-		alignIds.push(alignId);
+		for (int j = 0; j < 4; j++) {
+			alignIds.push(alignId);
 
-		Indices& indice = vbColorIdx.append();
-		indice.colorIdx = 31;		//white
-		indice.slice = slice;
+			Indices& indice = vbColorIdx.append();
+			indice.colorIdx = colorIdx;		
+			indice.slice = slice;
+		}
+	}
+	else {
+		unsigned int idx = reservedVbPos * 4;
+		for (int j = 0; j < 4; j++) {
+			alignIds[idx + j] = alignId;
+
+			Indices& indice = vbColorIdx.getData()[idx + j];
+			indice.colorIdx = colorIdx;		
+			indice.slice = slice;
+		}
+
+		CVector2 v, uv;
+		v.set(xa, yTop); vbPos.getData()[idx] = v;
+		uv.set(ltu, ltv); vbUv.getData()[idx] = uv;		//left top
+		idx++;
+
+		v.set(xb, yTop);  vbPos.getData()[idx] = v;
+		uv.set(bru, ltv);  vbUv.getData()[idx] = uv;			//right top
+		idx++;
+
+		v.set(xa, yBot);  vbPos.getData()[idx] = v;
+		uv.set(ltu, brv);  vbUv.getData()[idx] = uv;		//left bottom
+		idx++;
+
+		v.set(xb, yBot);  vbPos.getData()[idx] = v;
+		uv.set(bru, brv);  vbUv.getData()[idx] = uv;		//right bottom
 	}
 }
 
 //void addImage(unsigned int alignId, unsigned char slice, float ltu, float ltv, float bru, float brv, int x0, int x1, int y0, int y1);
 //x, y: leftop(0,0)
-void CNIFStaticBuffer::addSquardIcon(unsigned int idc_control, unsigned int alignId, 
+//1, addToAvlBvh is false usually on rebuilding.
+void CNIFStaticBuffer::addSquardIcon(unsigned int idc_control, unsigned int alignId, unsigned char colorIdx,
 	unsigned char slice, int imageW, int iconW, int iconx, int icony, int x, int y, bool addToAvlBvh)
 {
 	float iw = (float)iconW / (float)imageW;
 
-	return addImage(idc_control, alignId, slice, iconx * iw, icony * iw, (iconx + 1) * iw, (icony + 1) * iw, x, x + iconW, y, y + iconW, addToAvlBvh);
+	return addImage(idc_control, alignId, slice, colorIdx, iconx * iw, icony * iw, (iconx + 1) * iw, (icony + 1) * iw, x, x + iconW, y, y + iconW, addToAvlBvh, -1);
+}
+
+void CNIFStaticBuffer::delText(unsigned int strHeadNodeId)
+{
+	geAssert(strHeadNodeId != -1);
+	pool_type::HeadNode* headNode = pool.headNodeId2Ptr(strHeadNodeId);
+	for (pool_type::Node* node = pool.getFirstNode(headNode); node; node = pool.getNextNode(node)) {
+		bool b = tex.delChar(node->t.c);
+		geAssert(b);
+	}
+	pool.delList(strHeadNodeId);
 }
 
 bool CNIFStaticBuffer::del(unsigned int idc_control)
@@ -1359,19 +1665,20 @@ bool CNIFStaticBuffer::del(unsigned int idc_control)
 	//
 	// delete control specific data
 	//
-	CGrowableArrayWithLast<wchar_t>str;
-	CGrowableArrayWithLast<unsigned char>colors;
-	wchar_t* p;
+	//CGrowableArrayWithLast<wchar_t>str;
+	//CGrowableArrayWithLast<unsigned char>colors;
+	//wchar_t* p;
 	switch (eb->type) {
 	case 0:
-		getStringColorsFromPool(eb->strHeadNode, str, colors);
+		delText(eb->strHeadNode);
+		/*getStringColorsFromPool(eb->strHeadNode, str, colors);
 		p = str.get_objects();
 		while (*p) {
 			//delete from font bitmap
 			tex.delChar(*p);
 			p++;
 		}
-		pool.delList(eb->strHeadNode);
+		pool.delList(eb->strHeadNode);*/
 		break;
 	case 1:
 		break;
@@ -1394,11 +1701,11 @@ void CNIFStaticBuffer::updateVbPos(void)
 	vbPos.updateBuffer();
 }
 
-void CNIFStaticBuffer::updatePosUvColor(void)
+void CNIFStaticBuffer::updateVbPosUvColor(void)
 {
 	vbPos.updateBuffer();
 	vbUv.updateBuffer();
-	CNIFColorIdx::updateBuffer();
+	CNIFColorIdx::updateVbColorIdx();
 }
 
 void CNIFStaticBuffer::resize(int screenW, int screenH)
@@ -1524,9 +1831,135 @@ void CNIFStaticBuffer::render(void)
 	CDX11Device::immediate_context->DrawIndexed(faceIdxCnt, 0, 0);
 }
 
+void CNIFStaticBuffer::moveAllControlsInBvh(bvh_type::Node* node, int dx, int dy)
+{
+	node->bbox.vmin.x += dx;
+	node->bbox.vmin.z += dy;
+	node->bbox.vmax.x += dx;
+	node->bbox.vmax.z += dy;
+
+	if (node->left)moveAllControlsInBvh(node->left, dx, dy);
+	if (node->right)moveAllControlsInBvh(node->right, dx, dy);
+}
+
+void CNIFStaticBuffer::moveAllControls(int dx, int dy)
+{
+	moveAllControlsInBvh(bvh.getRoot(), dx, dy);
+	
+	tree_type::iterator iter;
+	controls.set_iterator_to_first(iter);
+	for (ControlInfo* ci = controls.get_current_value(iter); ci; ci = controls.get_next_value(iter)) {
+		ci->x0 += dx;
+		ci->y0 += dy;
+		ci->x1 += dx;
+		ci->y1 += dy;
+	}
+}
+
+//rebuild is needed afterwards for this to take effect.
+void CNIFStaticBuffer::moveControl(unsigned int idc_control, int dx, int dy)
+{
+	//
+	// del in bvh
+	//
+	ControlInfo* eb = controls.find(idc_control);
+
+	GE_MATH::CAabbBox4D box;
+	box.vmin.x = (float)eb->x0;
+	box.vmax.x = (float)eb->x1;
+	box.vmin.z = (float)eb->y0;
+	box.vmax.z = (float)eb->y1;
+	box.vmin.y = 0;
+	box.vmax.y = 0;
+
+	bool b = bvh.del(box, idc_control);
+	geAssert(b);
+
+	//
+	// move in avl
+	//
+	eb->x0 += dx;
+	eb->y0 += dy;
+	eb->x1 += dx;
+	eb->y1 += dy;
+
+	//
+	// add back to bvh
+	//
+	box.vmin.x = (float)eb->x0;
+	box.vmax.x = (float)eb->x1;
+	box.vmin.z = (float)eb->y0;
+	box.vmax.z = (float)eb->y1;
+
+	bvh_type::node_pointer_type node = bvh.add(box);
+	node->t = idc_control;
+}
+
+//this dumps all box at (z=0)
+void CNIFStaticBuffer::dumpBox(CGrowableArrayWithLast< GE_MATH::CAabbBox4D>& boxes)
+{
+	tree_type::iterator iter;
+	controls.set_iterator_to_first(iter);
+	for (ControlInfo* ci = controls.get_current_value(iter); ci; ci = controls.get_next_value(iter)) {
+		unsigned int idc_control = *controls.get_current_key(iter);
+		GE_MATH::CAabbBox4D& box = boxes.append();
+
+		int x0 = ci->x0;
+		int y0 = ci->y0;
+		int x1 = ci->x1;
+		int y1 = ci->y1;
+
+		x0 -= screenW >> 1;			//from left(0) to center(0)
+		x1 -= screenW >> 1;
+		y0 = screenH - y0;			//from bottom(0) to top(0), axis goes top-down
+		y1 = screenH - y1;
+		y0 -= screenH >> 1;			//from top(0) to center(0), axis goes top-down
+		y1 -= screenH >> 1;
+
+		//
+		float pixelHeight = 2.f / screenH;
+		float pixelWidth = 2.f / screenW;
+
+		float yTop = y0 * pixelHeight;
+		float yBot = y1 * pixelHeight;
+		float xa = x0 * pixelWidth;
+		float xb = x1 * pixelWidth;
+
+		yTop -= pixelHeight * 0.5f;		//TODO: is this shifting really still needed??? (microsoft map texel to pixel)
+		yBot -= pixelHeight * 0.5f;
+		xa -= pixelWidth * 0.5f;
+		xb -= pixelWidth * 0.5f;
+
+		box.vmin.set(xa, yBot, 0); 
+		box.vmax.set(xb, yTop, 0);
+	}
+}
+
 void CNIFStaticBuffer::dump(void)
 {
-	CNIFBase::dump(vbPos);
+	//CNIFBase::dump(vbPos);
+	ODS("vbPos[%d]\n", vbPos.getData().get_count());
+	ODS("vbUv[%d]\n", vbUv.getData().get_count());
+	
+	tex.dump();
+	CNIFColorIdx::dump();
+
+
+}
+
+CNIFStaticBuffer::ControlInfo* CNIFStaticBuffer::avlFind(unsigned int idc_control)
+{
+	return controls.find(idc_control);
+}
+
+bool CNIFStaticBuffer::bvhDel(GE_MATH::CAabbBox4D& box, unsigned int id)
+{
+	return bvh.del(box, id);
+}
+
+CNIFStaticBuffer::bvh_type::Node* CNIFStaticBuffer::bvhAdd(GE_MATH::CAabbBox4D& box)
+{
+	return bvh.add(box);
 }
 
 unsigned int CNIFStaticBuffer::bvhFind(int x, int y)
@@ -1548,6 +1981,15 @@ unsigned int CNIFStaticBuffer::bvhFind(int x, int y)
 	return -1;
 }
 
+void CNIFStaticBuffer::getStringFromPool(unsigned int headNodeId, CGrowableArrayWithLast<wchar_t>& str)
+{
+	pool_type::HeadNode* headNode = pool.headNodeId2Ptr(headNodeId);
+	for (pool_type::Node* node = pool.getFirstNode(headNode); node; node = pool.getNextNode(node)) {
+		str.push(node->t.c);
+	}
+	str.push(0);
+}
+
 void CNIFStaticBuffer::getStringColorsFromPool(unsigned int headNodeId, 
 	CGrowableArrayWithLast<wchar_t>& str, CGrowableArrayWithLast<unsigned char>& colors)
 {
@@ -1556,21 +1998,269 @@ void CNIFStaticBuffer::getStringColorsFromPool(unsigned int headNodeId,
 		str.push(node->t.c);
 		colors.push(node->t.colorIdx);
 	}
-
 	str.push(0);
 }
 
+void CNIFStaticBuffer::changeColorIdx(unsigned int idc_control, unsigned char colorIdx)
+{
+	//
+	// find from avl
+	//
+	ControlInfo* info = controls.find(idc_control);
+	geAssert(info);
+
+	//definition of colorIdx is in install_nif_font()
+	unsigned int pos = info->vbPosIdx << 2;
+	for (unsigned int i = 0; i < 4; i++) {
+		vbColorIdx.getData()[pos++].colorIdx = colorIdx;
+	}
+}
+
+void CNIFStaticBuffer::setCallback(int idc_control, CB cb)
+{
+	ControlInfo* ci = avlFind(idc_control);
+	geAssert(ci);
+
+	ci->cb = cb;
+}
+
+void CNIFStaticBuffer::onrBtnDrag(int x, int y, int dx, int dy, int msg_type)
+{
+	unsigned int idc_control = bvhFind(x, y);
+	if (lastRBtnDownId == -1 && idc_control == -1) {
+		return;
+	}
+
+	switch (msg_type) {
+	case MSG_RBTN_DOWN:
+		lastRBtnDownId = idc_control;
+		//ODS("down\n");
+		break;
+	case MSG_RBTN_UP:
+		lastRBtnDownId = -1;
+		//ODS("up\n");
+		break;
+	case MSG_MOUSE_OVER:
+		if (lastRBtnDownId != -1) {
+			moveAllControls(dx, dy);
+			rebuildFromAvl(false);
+			updateVbPosUvColor();
+			//ODS("over\n");
+		}
+		break;
+	}
+}
+
+void CNIFStaticBuffer::onlBtnClickCallbacks(int x, int y, int msg_type, 
+	unsigned char colorLeave, unsigned char colorOver, unsigned char colorDown)
+{
+	unsigned int idc_control = bvhFind(x, y);
+
+	//
+	// leave (close pair)
+	//
+	if (idc_control == -1) {
+		if (lastMouseOverId != -1) {
+			ControlInfo* lastCi = avlFind(lastMouseOverId);
+			if (lastCi->cb) {
+				changeTextColor(lastCi, colorLeave);
+				updateVbColorIdx();
+			}
+			lastMouseOverId = -1;
+		}
+		if (msg_type == MSG_LBTN_UP && lastLBtnDownId != -1) {
+			ControlInfo* lastCi = avlFind(lastLBtnDownId);
+			if (lastCi->cb) {
+				changeTextColor(lastCi, colorLeave);
+				updateVbColorIdx();
+			}
+			lastLBtnDownId = -1;
+		}
+		return;
+	}
+
+	//
+	// (open pair) -> this means set downId, overId, etc, in //set status
+	//
+	ControlInfo* ci;
+
+	unsigned int cnt = query_result.get_count();
+	if (cnt > 1) {
+		//
+		//sort the result with respect to parent, then call the one with minZ, or maybe just use active one???
+		//
+
+		//
+		//TODO: just find the one with callback, assuming no-overlapping.
+		//
+		for (unsigned int i = 0; i < cnt; i++) {
+			idc_control = query_result[i]->t;
+			ci = avlFind(idc_control);
+			if (ci->cb) {
+				break;
+			}
+		}
+
+	}
+	else {
+		ci = avlFind(idc_control);
+	}
+
+	//
+	// close pair for mouse_over
+	//
+	if (lastMouseOverId != -1 && lastMouseOverId != idc_control) {
+		ControlInfo* lastCi = avlFind(lastMouseOverId);
+		if (lastCi->cb) {
+			changeTextColor(lastCi, colorLeave);
+			updateVbColorIdx();
+		}
+	}
+
+	//
+	// call cb
+	//
+	if (ci && ci->cb) {
+		switch (msg_type) {
+		case MSG_LBTN_DOWN:
+			changeTextColor(ci, colorDown);
+			updateVbColorIdx();
+			break;
+		case MSG_LBTN_UP:
+			if (lastLBtnDownId != idc_control) {
+				changeTextColor(ci, colorLeave);
+				updateVbColorIdx();
+			}
+			else {
+				changeTextColor(idc_control, colorLeave);
+				updateVbColorIdx();
+				ci->cb(msg_type, this, idc_control, ci);
+			}
+			break;
+		case MSG_MOUSE_OVER:
+			changeTextColor(ci, colorOver);
+			updateVbColorIdx();
+			break;
+		}
+	}
+
+	//
+	// set status
+	// 
+	switch (msg_type) {
+	case MSG_LBTN_DOWN:
+		lastLBtnDownId = idc_control;
+		break;
+	case MSG_LBTN_UP:
+		lastLBtnDownId = -1;
+		break;
+	}
+
+	lastMouseOverId = idc_control;
+}
+
+void CNIFStaticBuffer::processCallbacks(int x, int y, int msg_type)
+{
+	unsigned int idc_control = bvhFind(x, y);
+
+	//
+	// leave (close pair)
+	//
+	if (idc_control == -1) {
+		if (lastMouseOverId != -1) {
+			ControlInfo* lastCi = avlFind(lastMouseOverId);
+			if (lastCi->cb) {
+				lastCi->cb(MSG_MOUSE_LEAVE, this, idc_control, lastCi);
+			}
+			lastMouseOverId = -1;
+		}
+		if (msg_type == MSG_LBTN_UP && lastLBtnDownId != -1) {
+			ControlInfo* lastCi = avlFind(lastLBtnDownId);
+			if (lastCi->cb) {
+				lastCi->cb(MSG_LBTN_UP, this, idc_control, lastCi);
+			}
+			lastLBtnDownId = -1;
+		}
+		return;
+	}
+
+	//
+	// (open pair) -> this means set downId, overId, etc, in //set status
+	//
+	ControlInfo* ci;
+
+	unsigned int cnt = query_result.get_count();
+	if (cnt > 1) {
+		//
+		//sort the result with respect to parent, then call the one with minZ, or maybe just use active one???
+		//
+
+		//
+		//TODO: just find the one with callback, assuming no-overlapping.
+		//
+		for (unsigned int i = 0; i < cnt; i++) {
+			idc_control = query_result[i]->t;
+			ci = avlFind(idc_control);
+			if (ci->cb) {
+				break;
+			}
+		}
+
+	}
+	else {
+		ci = avlFind(idc_control);
+	}
+
+	//
+	// close pair for mouse_over
+	//
+	if (lastMouseOverId != -1 && lastMouseOverId != idc_control) {
+		ControlInfo* lastCi = avlFind(lastMouseOverId);
+		if (lastCi->cb) {
+			lastCi->cb(MSG_MOUSE_LEAVE, this, lastMouseOverId, lastCi);
+		}
+	}
+
+	//
+	// call cb
+	//
+	if (ci && ci->cb) {
+		ci->cb(msg_type, this, idc_control, ci);
+	}
+
+	//
+	// set status
+	// 
+	switch (msg_type) {
+	case MSG_LBTN_DOWN:
+		lastLBtnDownId = idc_control;
+		break;
+	case MSG_LBTN_UP:
+		lastLBtnDownId = -1;
+		break;
+	}
+
+	lastMouseOverId = idc_control;
+}
 
 // after adding and deleting, this rebuild the entire vbPos, vbUv and vbColorIdx.
-void CNIFStaticBuffer::rebuildFromAvl(void)
+//1, render oder: small id first in controls.
+void CNIFStaticBuffer::rebuildFromAvl(bool createFont)
 {
+	//
+	//
+	//
+	vbPosIdx = 0;
+
 	vbPos.reset();
 	vbUv.reset();
 	alignIds.cleanup_content();
 
 	vbColorIdx.reset();
 
-	tex.reset();
+	if (createFont) {
+		tex.reset();
+	}
 
 	CGrowableArrayWithLast<wchar_t> str;
 	CGrowableArrayWithLast<unsigned char>colors;
@@ -1579,16 +2269,27 @@ void CNIFStaticBuffer::rebuildFromAvl(void)
 	controls.set_iterator_to_first(iter);
 	for (ControlInfo* eb = controls.get_current_value(iter); eb; eb = controls.get_next_value(iter)) {
 		unsigned int idc_control = *controls.get_current_key(iter);
+
+		int added, totalLines;
 	
 		switch (eb->type) {
 		case 0:
 			str.cleanup_content();
 			colors.cleanup_content();
 			getStringColorsFromPool(eb->strHeadNode, str, colors);
-			addText(idc_control, eb->align, str.get_objects(), colors.get_objects(), eb->x0, eb->x1, eb->y0, eb->y1, false);
+			addText(idc_control, eb->align, eb->localAlign, str.get_objects(), colors.get_objects(),
+				eb->x0 - alignOrigs[eb->align].x, 
+				eb->x1 - alignOrigs[eb->align].x,
+				eb->y0 - alignOrigs[eb->align].y,
+				eb->y1 - alignOrigs[eb->align].y, false, createFont, wcslen(str.get_objects()), added, false, totalLines);
 			break;
 		case 1:
-			addImage(idc_control, eb->align, eb->slice, eb->ltu, eb->ltv, eb->bru, eb->brv, eb->x0, eb->x1, eb->y0, eb->y1, false);
+			//geBreak(idc_control == 13);
+			addImage(idc_control, eb->align, eb->slice, eb->colorIdx, eb->ltu, eb->ltv, eb->bru, eb->brv, 
+				eb->x0 - alignOrigs[eb->align].x,
+				eb->x1 - alignOrigs[eb->align].x,
+				eb->y0 - alignOrigs[eb->align].y,
+				eb->y1 - alignOrigs[eb->align].y, false, -1);
 			break;
 		default:
 			geBreak(1);
@@ -1596,3 +2297,18 @@ void CNIFStaticBuffer::rebuildFromAvl(void)
 		}
 	}
 }
+
+
+
+
+
+
+
+
+//1, differences: display grid and pixels -> grid start from 0, pixels start from 0.5
+//2, The edges of the input quad need to lie upon the boundary lines between pixel cells. By simply shifting the x and y quad coordinates by -0.5 units, 
+//	texel cells will perfectly cover pixel cells and the quad can be perfectly recreated on the screen
+//3***, picture a 2x2 screen mapped with 2x2 texture quad, the pixels/texels are located at each individual center of screen cells.
+//4******-> screen cell centers, pixels, texels, those THREE things are at the same place. (pixel/texel are all infinitely small points, screen cells are 
+//	not, they are squares), and no such thing as texel quad??  
+//5, all above are for how to rasterize, with all those anti-aliasing technique or how to precisely(no streches) put a texture on screen.
